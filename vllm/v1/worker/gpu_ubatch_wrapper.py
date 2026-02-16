@@ -20,6 +20,10 @@ from vllm.forward_context import (
     override_forward_context,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.engram import (
+    ENGRAM_STEP_PAYLOAD_KEY,
+    slice_engram_step_payload,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import has_deep_gemm
@@ -303,10 +307,19 @@ class UBatchWrapper:
         dp_metadata,
         batch_descriptor,
         cudagraph_runtime_mode,
+        base_additional_kwargs: dict[str, Any] | None = None,
     ) -> list[UbatchMetadata]:
         # Create one forward context per ubatch
         forward_contexts = []
         for i, ubatch_slice in enumerate(ubatch_slices):
+            additional_kwargs = dict(base_additional_kwargs or {})
+            engram_payload = additional_kwargs.get(ENGRAM_STEP_PAYLOAD_KEY)
+            if engram_payload is not None:
+                additional_kwargs[ENGRAM_STEP_PAYLOAD_KEY] = slice_engram_step_payload(
+                    engram_payload,
+                    request_slice=ubatch_slice.request_slice,
+                    token_slice=ubatch_slice.token_slice,
+                )
             forward_contexts.append(
                 create_forward_context(
                     attn_metadata[i] if attn_metadata is not None else None,
@@ -314,6 +327,7 @@ class UBatchWrapper:
                     dp_metadata=dp_metadata[i],
                     batch_descriptor=batch_descriptor,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    additional_kwargs=additional_kwargs,
                 )
             )
 
@@ -448,6 +462,7 @@ class UBatchWrapper:
                 dp_metadata=ubatch_dp_metadata,
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                base_additional_kwargs=forward_context.additional_kwargs,
             )
             with self.sm_control:
                 return self._capture_ubatches(ubatch_metadata, self.model)
@@ -470,6 +485,7 @@ class UBatchWrapper:
                 dp_metadata=ubatch_dp_metadata,
                 batch_descriptor=batch_descriptor,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                base_additional_kwargs=forward_context.additional_kwargs,
             )
             with self.sm_control:
                 return self._run_ubatches(ubatch_metadata, self.model)

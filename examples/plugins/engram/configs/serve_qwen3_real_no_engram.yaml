@@ -1,0 +1,14 @@
+# Qwen3 baseline serve config (real weights, no Engram)
+# Usage:
+#   source ../venv-torch/bin/activate
+#   vllm serve --config examples/plugins/engram/configs/serve_qwen3_real_no_engram.yaml
+
+model: Qwen/Qwen3-1.7B
+served_model_name: Qwen/Qwen3-1.7B
+
+dtype: bfloat16
+load_format: auto
+enforce_eager: true
+
+max_model_len: 4096
+port: 8000

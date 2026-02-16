@@ -50,6 +50,10 @@ from vllm.forward_context import (
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.engram import (
+    ENGRAM_STEP_PAYLOAD_KEY,
+    build_engram_step_payload,
+)
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
@@ -467,6 +471,7 @@ class GPUModelRunner(
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self._engram_step_uid = 0
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -799,6 +804,102 @@ class GPUModelRunner(
         )
         return model_kwargs
 
+    def _maybe_build_engram_extra_additional_kwargs(
+        self, input_ids: torch.Tensor | None, num_reqs: int
+    ) -> dict[str, Any] | None:
+        if input_ids is None or num_reqs <= 0:
+            return None
+
+        actual_num_reqs = len(self.input_batch.req_ids)
+        if actual_num_reqs <= 0:
+            return None
+        effective_num_reqs = min(num_reqs, actual_num_reqs)
+
+        query_start_loc = self.query_start_loc.cpu[: effective_num_reqs + 1]
+        total_tokens = int(query_start_loc[-1].item())
+        engram_input_ids = self.input_ids.cpu[:total_tokens].to(dtype=torch.int64)
+        request_ids = self.input_batch.req_ids[:effective_num_reqs]
+        try:
+            engram_step_payload = build_engram_step_payload(
+                step_uid=self._engram_step_uid,
+                input_ids=engram_input_ids,
+                query_start_loc=query_start_loc,
+                request_ids=request_ids,
+            )
+        except ValueError as e:
+            runtime_state = getattr(self.model, "engram_runtime_state", None)
+            if runtime_state is None:
+                runtime_state = getattr(
+                    getattr(self.model, "module", None), "engram_runtime_state", None
+                )
+            layer_indices = tuple(getattr(runtime_state, "engram_layer_indices", ()))
+            if runtime_state is not None and layer_indices:
+                raise RuntimeError(
+                    "Failed to build Engram step payload while Engram is active."
+                ) from e
+            # For non-Engram models, payload is optional.
+            return None
+        self._engram_step_uid += 1
+        if engram_step_payload is None:
+            return None
+        self._maybe_schedule_engram_async_prefetch(engram_step_payload)
+        return {ENGRAM_STEP_PAYLOAD_KEY: engram_step_payload}
+
+    def _maybe_schedule_engram_async_prefetch(
+        self, engram_step_payload: dict[str, Any]
+    ) -> None:
+        runtime_state = getattr(self.model, "engram_runtime_state", None)
+        if runtime_state is None:
+            runtime_state = getattr(
+                getattr(self.model, "module", None), "engram_runtime_state", None
+            )
+        if runtime_state is None:
+            return
+        layer_indices = tuple(getattr(runtime_state, "engram_layer_indices", ()))
+        schedule_fn = getattr(runtime_state, "schedule_async_step_prefetch", None)
+        schedule_decode_fn = getattr(
+            runtime_state, "schedule_async_decode_step_prefetch", None
+        )
+        if not layer_indices or schedule_fn is None:
+            return
+        query_start_loc = engram_step_payload["query_start_loc"]
+        try:
+            token_counts = query_start_loc[1:] - query_start_loc[:-1]
+            is_decode_step = bool(
+                token_counts.numel() > 0 and torch.all(token_counts == 1).item()
+            )
+        except Exception:
+            is_decode_step = False
+
+        try:
+            if is_decode_step and schedule_decode_fn is not None:
+                schedule_decode_fn(
+                    step_uid=engram_step_payload["step_uid"],
+                    input_ids=engram_step_payload["input_ids"],
+                    query_start_loc=engram_step_payload["query_start_loc"],
+                    request_ids=engram_step_payload["request_ids"],
+                    layer_indices=layer_indices,
+                    target_device=self.device,
+                    target_dtype=self.dtype,
+                )
+            else:
+                schedule_fn(
+                    step_uid=engram_step_payload["step_uid"],
+                    input_ids=engram_step_payload["input_ids"],
+                    query_start_loc=engram_step_payload["query_start_loc"],
+                    request_ids=engram_step_payload["request_ids"],
+                    layer_indices=layer_indices,
+                    target_device=self.device,
+                    target_dtype=self.dtype,
+                )
+        except Exception:
+            logger.warning(
+                "Engram async prefetch scheduling failed at step_uid=%s; "
+                "continuing with sync fallback.",
+                engram_step_payload.get("step_uid"),
+                exc_info=True,
+            )
+
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
         """
         Update the order of requests in the batch based on the attention
@@ -834,6 +935,19 @@ class GPUModelRunner(
     def _sync_device(self) -> None:
         torch.cuda.synchronize()
 
+    def _cleanup_engram_finished_requests(self, finished_req_ids: list[str]) -> None:
+        if not finished_req_ids:
+            return
+        runtime_state = getattr(self.model, "engram_runtime_state", None)
+        if runtime_state is None:
+            runtime_state = getattr(getattr(self.model, "module", None), "engram_runtime_state", None)
+        if runtime_state is None:
+            return
+        cleanup_fn = getattr(runtime_state, "cleanup_requests", None)
+        if cleanup_fn is None:
+            return
+        cleanup_fn(list(finished_req_ids))
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -856,6 +970,7 @@ class GPUModelRunner(
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+        self._cleanup_engram_finished_requests(list(scheduler_output.finished_req_ids))
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -3284,6 +3399,9 @@ class GPUModelRunner(
                 cudagraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
+                extra_additional_kwargs=self._maybe_build_engram_extra_additional_kwargs(
+                    input_ids=input_ids, num_reqs=num_reqs
+                ),
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
@@ -4456,6 +4574,9 @@ class GPUModelRunner(
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
+                    extra_additional_kwargs=self._maybe_build_engram_extra_additional_kwargs(
+                        input_ids=input_ids, num_reqs=num_reqs
+                    ),
                 ),
             ):
                 outputs = self.model(

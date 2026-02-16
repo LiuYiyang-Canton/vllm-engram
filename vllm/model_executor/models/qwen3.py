@@ -35,6 +35,11 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+from vllm.model_executor.layers.engram import (
+    EngramLayer,
+    build_engram_layer_flags,
+    parse_and_validate_engram_hf_config,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -51,6 +56,39 @@ from .qwen2 import Qwen2Model
 from .utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
 
 logger = init_logger(__name__)
+
+
+def maybe_create_engram_layer(
+    config: Qwen3Config, layer_idx: int
+) -> EngramLayer | None:
+    if not bool(getattr(config, "engram_enable", False)):
+        setattr(config, "_vllm_engram_hf_config_cache", None)
+        setattr(config, "_vllm_engram_layer_flags_cache", None)
+        return None
+
+    engram_hf_config = getattr(config, "_vllm_engram_hf_config_cache", None)
+    if engram_hf_config is None:
+        engram_hf_config = parse_and_validate_engram_hf_config(config)
+        setattr(config, "_vllm_engram_hf_config_cache", engram_hf_config)
+
+    engram_layer_flags = getattr(config, "_vllm_engram_layer_flags_cache", None)
+    if engram_layer_flags is None:
+        engram_layer_flags = build_engram_layer_flags(
+            config.num_hidden_layers, engram_hf_config.layer_indices
+        )
+        setattr(config, "_vllm_engram_layer_flags_cache", engram_layer_flags)
+
+    if not engram_layer_flags[layer_idx]:
+        return None
+    return EngramLayer(
+        config.hidden_size,
+        layer_idx=layer_idx,
+        max_ngram_order=engram_hf_config.max_ngram_order,
+        engram_heads=engram_hf_config.heads,
+        engram_mem_dim=engram_hf_config.mem_dim,
+        conv_kernel=engram_hf_config.conv_kernel,
+        conv_dilation=engram_hf_config.conv_dilation,
+    )
 
 
 class Qwen3Attention(nn.Module):
@@ -204,6 +242,7 @@ class Qwen3DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.engram = maybe_create_engram_layer(config, extract_layer_index(prefix))
 
     def forward(
         self,
@@ -217,6 +256,8 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if self.engram is not None:
+            hidden_states = self.engram(hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,

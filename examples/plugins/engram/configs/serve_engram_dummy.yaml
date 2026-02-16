@@ -1,0 +1,31 @@
+# Engram dummy serve config (Qwen3-1.7B base shape)
+# Usage:
+#   source ../venv-torch/bin/activate
+#   pip install -e examples/plugins/engram
+#   VLLM_PLUGINS=register_engram_plugin vllm serve --config examples/plugins/engram/configs/serve_engram_dummy.yaml
+
+model: Qwen/Qwen3-1.7B
+served_model_name: Qwen/Qwen3-1.7B-Engram
+
+dtype: bfloat16
+load_format: auto
+enforce_eager: true
+
+max_model_len: 4096
+port: 8000
+
+# Flat/dotted keys are required in vLLM YAML config files.
+# Keep JSON-typed values as strings so argparse can reconstruct nested dicts.
+"hf_overrides.architectures": '["Qwen3EngramForCausalLM"]'
+"hf_overrides.engram_enable": "true"
+"hf_overrides.engram_layers": "[1,15]"
+"hf_overrides.engram_memory_size": 129800
+"hf_overrides.engram_max_ngram_order": 3
+"hf_overrides.engram_heads": 4
+"hf_overrides.engram_mem_dim": 1024
+"hf_overrides.engram_compression_ratio": 0.8
+"hf_overrides.engram_conv_kernel": 4
+"hf_overrides.engram_conv_dilation": 3
+"hf_overrides.engram_async_workers": 1
+"hf_overrides.engram_use_synthetic_weights": "true"
+"hf_overrides.engram_synthetic_seed": 2026
